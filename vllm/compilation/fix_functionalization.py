@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import operator
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -6,7 +8,8 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
 from vllm.logger import init_logger
 
-from .vllm_inductor_pass import VllmInductorPass, is_func
+from .fx_utils import is_func
+from .vllm_inductor_pass import VllmInductorPass
 
 logger = init_logger(__name__)
 
@@ -53,28 +56,37 @@ class FixFunctionalizationPass(VllmInductorPass):
                 self.insert_defunctionalized(graph, node)
                 self._remove(node)
 
-            # These 2 replacements avoid the most copies for LLaMa.
+            # rms_norm replacements avoid the most copies for LLaMa.
             elif at_target == torch.ops._C.fused_add_rms_norm.default:
                 mutated_args = {1: 'input', 2: 'residual'}
                 self.defunctionalize(graph, node, mutated_args)
             elif at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default:  # noqa: E501
                 mutated_args = {1: 'result', 2: 'residual'}
                 self.defunctionalize(graph, node, mutated_args)
-
+            elif at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default:  # noqa: E501
+                mutated_args = {1: 'result', 2: 'scale', 3: 'residual'}
+                self.defunctionalize(graph, node, mutated_args)
             elif at_target in [
                     torch.ops._C.rms_norm.default,
-                    torch.ops._C.rms_norm_static_fp8_quant.default
+                    torch.ops._C.rms_norm_static_fp8_quant.default,
             ]:
                 mutated_args = {1: 'result'}
                 self.defunctionalize(graph, node, mutated_args)
-
+            # For some reason we need to specify the args for both
+            # silu_and_mul and silu_and_mul_quant. The kwargs
+            # pathway gets the wrong answer.
             elif at_target == torch.ops._C.silu_and_mul.default:
-                mutated_args = {1: 'out'}
-                # Because we have an 'out', need to specify args directly
+                mutated_args = {1: 'result'}
                 self.defunctionalize(graph,
                                      node,
                                      mutated_args,
-                                     args=('out', 'input'))
+                                     args=('result', 'input'))
+            elif at_target == torch.ops._C.silu_and_mul_quant.default:
+                mutated_args = {1: 'result'}
+                self.defunctionalize(graph,
+                                     node,
+                                     mutated_args,
+                                     args=('result', 'input', 'scale'))
             else:
                 continue  # skip the count
 

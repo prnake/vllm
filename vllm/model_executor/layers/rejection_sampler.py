@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from functools import cached_property
 from importlib.util import find_spec
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.jit
@@ -9,6 +11,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.spec_decode_base_sampler import (
     SpecDecodeStochasticBaseSampler)
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -39,7 +42,7 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
             strict_mode: Whether or not to perform shape/device/dtype checks
             during sampling. This catches correctness issues but adds
             nontrivial latency.
-            use_falshinfer: We will use this parameter to determine whether
+            use_flashinfer: We will use this parameter to determine whether
             to use the FlashInfer rejection sampling kernel or not. If it's
             None, we will use the default value from the environment variable.
             This parameter is only used for testing purposes.
@@ -118,7 +121,7 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
 
         # If use Flashinfer chain_speculative_sampling kernel
         # for rejection sampling
-        if self.use_flashinfer:
+        if self.use_flashinfer and chain_speculative_sampling is not None:
             batch_size, k, _ = draft_probs.shape
             uniform_samples = self._create_uniform_samples(
                 seeded_seqs, batch_size, k, draft_probs.device)
@@ -258,15 +261,16 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
         True, then a token can be accepted, else it should be
         rejected.
 
-        Given :math:`q(\hat{x}_{n+1}|x_1, \dots, x_n)`, the probability of
-        :math:`\hat{x}_{n+1}` given context :math:`x_1, \dots, x_n` according
-        to the target model, and :math:`p(\hat{x}_{n+1}|x_1, \dots, x_n)`, the
+        Given {math}`q(\hat{x}_{n+1}|x_1, \dots, x_n)`, the probability of
+        {math}`\hat{x}_{n+1}` given context {math}`x_1, \dots, x_n` according
+        to the target model, and {math}`p(\hat{x}_{n+1}|x_1, \dots, x_n)`, the
         same conditional probability according to the draft model, the token
         is accepted with probability:
 
-        .. math::
-            \min\left(1, \frac{q(\hat{x}_{n+1}|x_1, \dots, x_n)}
-                           {p(\hat{x}_{n+1}|x_1, \dots, x_n)}\right)
+        :::{math}
+        \min\left(1, \frac{q(\hat{x}_{n+1}|x_1, \dots, x_n)}
+                        {p(\hat{x}_{n+1}|x_1, \dots, x_n)}\right)
+        :::
 
         This implementation does not apply causality. When using the output,
         if a token is rejected, subsequent tokens should not be used.
@@ -309,18 +313,20 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
         target model is recovered (within hardware numerics).
 
         The probability distribution used in this rejection case is constructed
-        as follows. Given :math:`q(x|x_1, \dots, x_n)`, the probability of
-        :math:`x` given context :math:`x_1, \dots, x_n` according to the target
-        model and :math:`p(x|x_1, \dots, x_n)`, the same conditional probability
+        as follows. Given {math}`q(x|x_1, \dots, x_n)`, the probability of
+        {math}`x` given context {math}`x_1, \dots, x_n` according to the target
+        model and {math}`p(x|x_1, \dots, x_n)`, the same conditional probability
         according to the draft model:
 
-        .. math::
-            x_{n+1} \sim (q(x|x_1, \dots, x_n) - p(x|x_1, \dots, x_n))_+
+        :::{math}
+        x_{n+1} \sim (q(x|x_1, \dots, x_n) - p(x|x_1, \dots, x_n))_+
+        :::
 
-        where :math:`(f(x))_+` is defined as:
+        where {math}`(f(x))_+` is defined as:
 
-        .. math::
-            (f(x))_+ = \frac{\max(0, f(x))}{\sum_x \max(0, f(x))}
+        :::{math}
+        (f(x))_+ = \frac{\max(0, f(x))}{\sum_x \max(0, f(x))}
+        :::
 
         See https://github.com/vllm-project/vllm/pull/2336 for a visualization
         of the draft, target, and recovered probability distributions.
@@ -368,7 +374,7 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
 # Note that we always sample with replacement.
 # probs will be modified in place, but this is fine, as we pass
 # in a copy already.
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def _multinomial(
     probs: torch.Tensor,
     num_samples: int,
@@ -386,16 +392,12 @@ def _multinomial(
     if not seeded_seqs:
         q.exponential_(1.0)
     else:
-        non_seeded_indices: List[int] = []
         start = 0
         for idx in range(len(q) // k):
             end = start + k
             generator = seeded_seqs.get(idx)
-            if generator is None:
-                non_seeded_indices.extend(list(range(start, end)))
-            else:
-                q[start:end].exponential_(1.0, generator=generator)
+            # Note: generator might be None for non seeded
+            q[start:end].exponential_(1.0, generator=generator)
             start = end
-        q[non_seeded_indices].exponential_(1.0)
 
     return probs.div_(q).argmax(dim=1).view(-1, num_samples)

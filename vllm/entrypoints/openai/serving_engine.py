@@ -1,15 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import json
-import pathlib
+import sys
+import time
+from collections.abc import (AsyncGenerator, Iterable, Iterator, Mapping,
+                             Sequence)
 from concurrent.futures.thread import ThreadPoolExecutor
-from dataclasses import dataclass
 from http import HTTPStatus
-from typing import (Any, Callable, Dict, Iterable, Iterator, List, Mapping,
-                    Optional, Sequence, Tuple, TypedDict, Union)
+from typing import (Annotated, Any, Callable, ClassVar, Generic, Optional,
+                    TypeVar, Union)
 
-from pydantic import Field
+from fastapi import Request
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import Headers
-from typing_extensions import Annotated
 
+if sys.version_info >= (3, 12):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
+
+import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 # yapf conflicts with isort for this block
@@ -23,82 +33,155 @@ from vllm.entrypoints.chat_utils import (ChatCompletionMessageParam,
                                          resolve_chat_template_content_format)
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
+                                              ChatCompletionResponse,
+                                              ClassificationRequest,
+                                              ClassificationResponse,
                                               CompletionRequest,
+                                              CompletionResponse,
                                               DetokenizeRequest,
                                               EmbeddingChatRequest,
                                               EmbeddingCompletionRequest,
-                                              ErrorResponse,
-                                              LoadLoraAdapterRequest,
-                                              ModelCard, ModelList,
-                                              ModelPermission,
+                                              EmbeddingRequest,
+                                              EmbeddingResponse, ErrorResponse,
+                                              PoolingResponse, RerankRequest,
+                                              ScoreRequest, ScoreResponse,
                                               TokenizeChatRequest,
                                               TokenizeCompletionRequest,
-                                              UnloadLoraAdapterRequest)
+                                              TokenizeResponse,
+                                              TranscriptionRequest,
+                                              TranscriptionResponse)
+from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.openai.tool_parsers import ToolParser
 # yapf: enable
 from vllm.inputs import TokensPrompt
 from vllm.inputs.parse import parse_and_batch_prompt
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.multimodal import (  # noqa: F401 - Required to resolve Pydantic error in RequestProcessingMixin
+    MultiModalDataDict)
+from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import BeamSearchParams, SamplingParams
-from vllm.sequence import Logprob
+from vllm.sequence import Logprob, PromptLogprobs
 from vllm.tracing import (contains_trace_headers, extract_trace_headers,
                           log_tracing_disabled_warning)
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
-from vllm.utils import AtomicCounter, is_list_of, make_async
+from vllm.utils import (is_list_of, make_async, merge_async_iterators,
+                        random_uuid)
 
 logger = init_logger(__name__)
 
-
-@dataclass
-class BaseModelPath:
-    name: str
-    model_path: str
-
-
-@dataclass
-class PromptAdapterPath:
-    name: str
-    local_path: str
-
-
-@dataclass
-class LoRAModulePath:
-    name: str
-    path: str
-    base_model_name: Optional[str] = None
-
-
 CompletionLikeRequest = Union[CompletionRequest, DetokenizeRequest,
-                              EmbeddingCompletionRequest,
+                              EmbeddingCompletionRequest, RerankRequest,
+                              ClassificationRequest, ScoreRequest,
                               TokenizeCompletionRequest]
 
 ChatLikeRequest = Union[ChatCompletionRequest, EmbeddingChatRequest,
                         TokenizeChatRequest]
 
-AnyRequest = Union[CompletionLikeRequest, ChatLikeRequest]
+AnyRequest = Union[CompletionLikeRequest, ChatLikeRequest,
+                   TranscriptionRequest]
+
+AnyResponse = Union[
+    CompletionResponse,
+    ChatCompletionResponse,
+    EmbeddingResponse,
+    TranscriptionResponse,
+    TokenizeResponse,
+    PoolingResponse,
+    ClassificationResponse,
+    ScoreResponse,
+]
 
 
 class TextTokensPrompt(TypedDict):
     prompt: str
-    prompt_token_ids: List[int]
+    prompt_token_ids: list[int]
 
 
-RequestPrompt = Union[List[int], str, TextTokensPrompt]
+RequestPrompt = Union[list[int], str, TextTokensPrompt]
+
+RequestT = TypeVar("RequestT", bound=AnyRequest)
+
+
+class RequestProcessingMixin(BaseModel):
+    """
+    Mixin for request processing, 
+    handling prompt preparation and engine input.
+    """
+    request_prompts: Optional[Sequence[RequestPrompt]] = \
+                            Field(default_factory=list)
+    engine_prompts: Optional[list[TokensPrompt]] = \
+                            Field(default_factory=list)
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+class ResponseGenerationMixin(BaseModel):
+    """
+    Mixin for response generation, 
+    managing result generators and final batch results.
+    """
+    result_generator: Optional[AsyncGenerator[tuple[int, Union[
+        RequestOutput, PoolingRequestOutput]], None]] = None
+    final_res_batch: list[Union[RequestOutput, PoolingRequestOutput]] = Field(
+        default_factory=list)
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+class ServeContext(RequestProcessingMixin, ResponseGenerationMixin, BaseModel,
+                   Generic[RequestT]):
+    # Shared across all requests
+    request: RequestT
+    raw_request: Optional[Request] = None
+    model_name: str
+    request_id: str
+    created_time: int = Field(default_factory=lambda: int(time.time()))
+    lora_request: Optional[LoRARequest] = None
+    prompt_adapter_request: Optional[PromptAdapterRequest] = None
+
+    # Shared across most requests
+    tokenizer: Optional[AnyTokenizer] = None
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+
+    # `protected_namespaces` resolves Pydantic v2's warning
+    # on conflict with protected namespace "model_"
+    model_config = ConfigDict(
+        protected_namespaces=(),
+        arbitrary_types_allowed=True,
+    )
+
+
+ClassificationServeContext = ServeContext[ClassificationRequest]
+
+
+class EmbeddingServeContext(ServeContext[EmbeddingRequest]):
+    chat_template: Optional[str] = None
+    chat_template_content_format: ChatTemplateContentFormatOption
+
+
+# Used to resolve the Pydantic error related to
+# forward reference of MultiModalDataDict in TokensPrompt
+RequestProcessingMixin.model_rebuild()
+ServeContext.model_rebuild()
+ClassificationServeContext.model_rebuild()
+EmbeddingServeContext.model_rebuild()
 
 
 class OpenAIServing:
+    request_id_prefix: ClassVar[str] = """
+    A short string prepended to every request’s ID (e.g. "embd", "classify")
+    so you can easily tell “this ID came from Embedding vs Classification.”
+    """
 
     def __init__(
         self,
         engine_client: EngineClient,
         model_config: ModelConfig,
-        base_model_paths: List[BaseModelPath],
+        models: OpenAIServingModels,
         *,
-        lora_modules: Optional[List[LoRAModulePath]],
-        prompt_adapters: Optional[List[PromptAdapterPath]],
         request_logger: Optional[RequestLogger],
         return_tokens_as_token_ids: bool = False,
     ):
@@ -108,35 +191,7 @@ class OpenAIServing:
         self.model_config = model_config
         self.max_model_len = model_config.max_model_len
 
-        self.base_model_paths = base_model_paths
-
-        self.lora_id_counter = AtomicCounter(0)
-        self.lora_requests = []
-        if lora_modules is not None:
-            self.lora_requests = [
-                LoRARequest(lora_name=lora.name,
-                            lora_int_id=i,
-                            lora_path=lora.path,
-                            base_model_name=lora.base_model_name
-                            if lora.base_model_name
-                            and self._is_model_supported(lora.base_model_name)
-                            else self.base_model_paths[0].name)
-                for i, lora in enumerate(lora_modules, start=1)
-            ]
-
-        self.prompt_adapter_requests = []
-        if prompt_adapters is not None:
-            for i, prompt_adapter in enumerate(prompt_adapters, start=1):
-                with pathlib.Path(prompt_adapter.local_path,
-                                  "adapter_config.json").open() as f:
-                    adapter_config = json.load(f)
-                    num_virtual_tokens = adapter_config["num_virtual_tokens"]
-                self.prompt_adapter_requests.append(
-                    PromptAdapterRequest(
-                        prompt_adapter_name=prompt_adapter.name,
-                        prompt_adapter_id=i,
-                        prompt_adapter_local_path=prompt_adapter.local_path,
-                        prompt_adapter_num_virtual_tokens=num_virtual_tokens))
+        self.models = models
 
         self.request_logger = request_logger
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
@@ -149,32 +204,166 @@ class OpenAIServing:
             self._tokenize_prompt_input_or_inputs,
             executor=self._tokenizer_executor)
 
-    async def show_available_models(self) -> ModelList:
-        """Show available models. Right now we only have one model."""
-        model_cards = [
-            ModelCard(id=base_model.name,
-                      max_model_len=self.max_model_len,
-                      root=base_model.model_path,
-                      permission=[ModelPermission()])
-            for base_model in self.base_model_paths
-        ]
-        lora_cards = [
-            ModelCard(id=lora.lora_name,
-                      root=lora.local_path,
-                      parent=lora.base_model_name if lora.base_model_name else
-                      self.base_model_paths[0].name,
-                      permission=[ModelPermission()])
-            for lora in self.lora_requests
-        ]
-        prompt_adapter_cards = [
-            ModelCard(id=prompt_adapter.prompt_adapter_name,
-                      root=self.base_model_paths[0].name,
-                      permission=[ModelPermission()])
-            for prompt_adapter in self.prompt_adapter_requests
-        ]
-        model_cards.extend(lora_cards)
-        model_cards.extend(prompt_adapter_cards)
-        return ModelList(data=model_cards)
+    async def _preprocess(
+        self,
+        ctx: ServeContext,
+    ) -> Optional[ErrorResponse]:
+        """
+        Default preprocessing hook. Subclasses may override
+        to prepare `ctx` (classification, embedding, etc.).
+        """
+        return None
+
+    def _build_response(
+        self,
+        ctx: ServeContext,
+    ) -> Union[AnyResponse, ErrorResponse]:
+        """
+        Default response builder. Subclass may override this method
+        to return the appropriate response object.
+        """
+        return self.create_error_response("unimplemented endpoint")
+
+    async def handle(
+        self,
+        ctx: ServeContext,
+    ) -> Union[AnyResponse, ErrorResponse]:
+        generation: AsyncGenerator[Union[AnyResponse, ErrorResponse], None]
+        generation = self._pipeline(ctx)
+
+        async for response in generation:
+            return response
+
+        return self.create_error_response("No response yielded from pipeline")
+
+    async def _pipeline(
+        self,
+        ctx: ServeContext,
+    ) -> AsyncGenerator[Union[AnyResponse, ErrorResponse], None]:
+        """Execute the request processing pipeline yielding responses."""
+        if error := await self._check_model(ctx.request):
+            yield error
+        if error := self._validate_request(ctx):
+            yield error
+
+        preprocess_ret = await self._preprocess(ctx)
+        if isinstance(preprocess_ret, ErrorResponse):
+            yield preprocess_ret
+
+        generators_ret = await self._prepare_generators(ctx)
+        if isinstance(generators_ret, ErrorResponse):
+            yield generators_ret
+
+        collect_ret = await self._collect_batch(ctx)
+        if isinstance(collect_ret, ErrorResponse):
+            yield collect_ret
+
+        yield self._build_response(ctx)
+
+    def _validate_request(self, ctx: ServeContext) -> Optional[ErrorResponse]:
+        truncate_prompt_tokens = getattr(ctx.request, "truncate_prompt_tokens",
+                                         None)
+
+        if truncate_prompt_tokens is not None:
+            if truncate_prompt_tokens <= self.max_model_len:
+                ctx.truncate_prompt_tokens = truncate_prompt_tokens
+            else:
+                return self.create_error_response(
+                    "truncate_prompt_tokens value is "
+                    "greater than max_model_len."
+                    " Please, select a smaller truncation size.")
+        return None
+
+    async def _prepare_generators(
+        self,
+        ctx: ServeContext,
+    ) -> Optional[ErrorResponse]:
+        """Schedule the request and get the result generator."""
+        generators: list[AsyncGenerator[Union[RequestOutput,
+                                              PoolingRequestOutput],
+                                        None]] = []
+
+        try:
+            trace_headers = (None if ctx.raw_request is None else await
+                             self._get_trace_headers(ctx.raw_request.headers))
+
+            if not hasattr(ctx.request, "to_pooling_params"):
+                return self.create_error_response(
+                    "Request type does not support pooling parameters")
+
+            pooling_params = ctx.request.to_pooling_params()
+
+            if ctx.engine_prompts is None:
+                return self.create_error_response(
+                    "Engine prompts not available")
+
+            for i, engine_prompt in enumerate(ctx.engine_prompts):
+                request_id_item = f"{ctx.request_id}-{i}"
+
+                if ctx.request_prompts is None:
+                    return self.create_error_response(
+                        "Request prompts not available")
+
+                self._log_inputs(
+                    request_id_item,
+                    ctx.request_prompts[i],
+                    params=pooling_params,
+                    lora_request=ctx.lora_request,
+                    prompt_adapter_request=ctx.prompt_adapter_request)
+
+                generator = self.engine_client.encode(
+                    engine_prompt,
+                    pooling_params,
+                    request_id_item,
+                    lora_request=ctx.lora_request,
+                    trace_headers=trace_headers,
+                    priority=getattr(ctx.request, "priority", 0),
+                )
+
+                generators.append(generator)
+
+            ctx.result_generator = merge_async_iterators(*generators)
+
+            return None
+
+        except Exception as e:
+            # TODO: Use a vllm-specific Validation Error
+            return self.create_error_response(str(e))
+
+    async def _collect_batch(
+        self,
+        ctx: ServeContext,
+    ) -> Optional[ErrorResponse]:
+        """Collect batch results from the result generator."""
+        try:
+            if ctx.engine_prompts is None:
+                return self.create_error_response(
+                    "Engine prompts not available")
+
+            num_prompts = len(ctx.engine_prompts)
+            final_res_batch: list[Optional[Union[RequestOutput,
+                                                 PoolingRequestOutput]]]
+            final_res_batch = [None] * num_prompts
+
+            if ctx.result_generator is None:
+                return self.create_error_response(
+                    "Result generator not available")
+
+            async for i, res in ctx.result_generator:
+                final_res_batch[i] = res
+
+            if None in final_res_batch:
+                return self.create_error_response(
+                    "Failed to generate results for all prompts")
+
+            ctx.final_res_batch = [
+                res for res in final_res_batch if res is not None
+            ]
+
+            return None
+
+        except Exception as e:
+            return self.create_error_response(str(e))
 
     def create_error_response(
             self,
@@ -202,30 +391,43 @@ class OpenAIServing:
         self,
         request: AnyRequest,
     ) -> Optional[ErrorResponse]:
+
+        error_response = None
+
         if self._is_model_supported(request.model):
             return None
-        if request.model in [lora.lora_name for lora in self.lora_requests]:
-            return None
         if request.model in [
-                prompt_adapter.prompt_adapter_name
-                for prompt_adapter in self.prompt_adapter_requests
+                lora.lora_name for lora in self.models.lora_requests
         ]:
             return None
-        return self.create_error_response(
+        if envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING and request.model and (
+                load_result := await self.models.resolve_lora(request.model)):
+            if isinstance(load_result, LoRARequest):
+                return None
+            if isinstance(load_result, ErrorResponse) and \
+                load_result.code == HTTPStatus.BAD_REQUEST.value:
+                error_response = load_result
+        if request.model in [
+                prompt_adapter.prompt_adapter_name
+                for prompt_adapter in self.models.prompt_adapter_requests
+        ]:
+            return None
+
+        return error_response or self.create_error_response(
             message=f"The model `{request.model}` does not exist.",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND)
 
     def _maybe_get_adapters(
         self, request: AnyRequest
-    ) -> Union[Tuple[None, None], Tuple[LoRARequest, None], Tuple[
+    ) -> Union[tuple[None, None], tuple[LoRARequest, None], tuple[
             None, PromptAdapterRequest]]:
         if self._is_model_supported(request.model):
             return None, None
-        for lora in self.lora_requests:
+        for lora in self.models.lora_requests:
             if request.model == lora.lora_name:
                 return lora, None
-        for prompt_adapter in self.prompt_adapter_requests:
+        for prompt_adapter in self.models.prompt_adapter_requests:
             if request.model == prompt_adapter.prompt_adapter_name:
                 return None, prompt_adapter
         # if _check_model has been called earlier, this will be unreachable
@@ -236,11 +438,22 @@ class OpenAIServing:
         request: AnyRequest,
         tokenizer: AnyTokenizer,
         prompt: str,
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]],
+        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]],
         add_special_tokens: bool,
     ) -> TextTokensPrompt:
+        if (self.model_config.encoder_config is not None
+                and self.model_config.encoder_config.get(
+                    "do_lower_case", False)):
+            prompt = prompt.lower()
+
         if truncate_prompt_tokens is None:
             encoded = tokenizer(prompt, add_special_tokens=add_special_tokens)
+        elif truncate_prompt_tokens < 0:
+            # Negative means we cap at the model's max length
+            encoded = tokenizer(prompt,
+                                add_special_tokens=add_special_tokens,
+                                truncation=True,
+                                max_length=self.max_model_len)
         else:
             encoded = tokenizer(prompt,
                                 add_special_tokens=add_special_tokens,
@@ -257,11 +470,13 @@ class OpenAIServing:
         self,
         request: AnyRequest,
         tokenizer: AnyTokenizer,
-        prompt_ids: List[int],
+        prompt_ids: list[int],
         truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]],
     ) -> TextTokensPrompt:
         if truncate_prompt_tokens is None:
             input_ids = prompt_ids
+        elif truncate_prompt_tokens < 0:
+            input_ids = prompt_ids[-self.max_model_len:]
         else:
             input_ids = prompt_ids[-truncate_prompt_tokens:]
 
@@ -272,20 +487,27 @@ class OpenAIServing:
     def _validate_input(
         self,
         request: AnyRequest,
-        input_ids: List[int],
+        input_ids: list[int],
         input_text: str,
     ) -> TextTokensPrompt:
         token_num = len(input_ids)
 
-        # Note: EmbeddingRequest doesn't have max_tokens
+        # Note: EmbeddingRequest, ClassificationRequest,
+        # and ScoreRequest doesn't have max_tokens
         if isinstance(request,
-                      (EmbeddingChatRequest, EmbeddingCompletionRequest)):
+                      (EmbeddingChatRequest, EmbeddingCompletionRequest,
+                       ScoreRequest, RerankRequest, ClassificationRequest)):
+            operation = {
+                ScoreRequest: "score",
+                ClassificationRequest: "classification"
+            }.get(type(request), "embedding generation")
+
             if token_num > self.max_model_len:
                 raise ValueError(
                     f"This model's maximum context length is "
                     f"{self.max_model_len} tokens. However, you requested "
-                    f"{token_num} tokens in the input for embedding "
-                    f"generation. Please reduce the length of the input.")
+                    f"{token_num} tokens in the input for {operation}. "
+                    f"Please reduce the length of the input.")
             return TextTokensPrompt(prompt=input_text,
                                     prompt_token_ids=input_ids)
 
@@ -301,7 +523,7 @@ class OpenAIServing:
             # TODO(#9845): remove max_tokens when field dropped from OpenAI API
             max_tokens = request.max_completion_tokens or request.max_tokens
         else:
-            max_tokens = request.max_tokens
+            max_tokens = getattr(request, "max_tokens", None)
         if max_tokens is None:
             if token_num >= self.max_model_len:
                 raise ValueError(
@@ -324,12 +546,12 @@ class OpenAIServing:
         self,
         request: AnyRequest,
         tokenizer: AnyTokenizer,
-        prompt_input: Union[str, List[int]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
+        prompt_input: Union[str, list[int]],
+        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None,
         add_special_tokens: bool = True,
     ) -> TextTokensPrompt:
         """
-        A simpler implementation of :meth:`_tokenize_prompt_input_or_inputs`
+        A simpler implementation of {meth}`_tokenize_prompt_input_or_inputs`
         that assumes single input.
         """
         return next(
@@ -345,12 +567,12 @@ class OpenAIServing:
         self,
         request: AnyRequest,
         tokenizer: AnyTokenizer,
-        prompt_inputs: Iterable[Union[str, List[int]]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
+        prompt_inputs: Iterable[Union[str, list[int]]],
+        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None,
         add_special_tokens: bool = True,
     ) -> Iterator[TextTokensPrompt]:
         """
-        A simpler implementation of :meth:`_tokenize_prompt_input_or_inputs`
+        A simpler implementation of {meth}`_tokenize_prompt_input_or_inputs`
         that assumes multiple inputs.
         """
         for text in prompt_inputs:
@@ -374,10 +596,10 @@ class OpenAIServing:
         self,
         request: AnyRequest,
         tokenizer: AnyTokenizer,
-        input_or_inputs: Union[str, List[str], List[int], List[List[int]]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
+        input_or_inputs: Union[str, list[str], list[int], list[list[int]]],
+        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None,
         add_special_tokens: bool = True,
-    ) -> List[TextTokensPrompt]:
+    ) -> list[TextTokensPrompt]:
         """
         Tokenize/detokenize depending on the input format.
 
@@ -409,10 +631,10 @@ class OpenAIServing:
         self,
         request: CompletionLikeRequest,
         tokenizer: AnyTokenizer,
-        input_or_inputs: Union[str, List[str], List[int], List[List[int]]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
+        input_or_inputs: Union[str, list[str], list[int], list[list[int]]],
+        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None,
         add_special_tokens: bool = True,
-    ) -> Tuple[List[TextTokensPrompt], List[TokensPrompt]]:
+    ) -> tuple[list[TextTokensPrompt], list[TokensPrompt]]:
         request_prompts = await self._tokenize_prompt_input_or_inputs_async(
             request,
             tokenizer,
@@ -432,32 +654,36 @@ class OpenAIServing:
         self,
         request: ChatLikeRequest,
         tokenizer: AnyTokenizer,
-        messages: List[ChatCompletionMessageParam],
+        messages: list[ChatCompletionMessageParam],
         chat_template: Optional[str],
         chat_template_content_format: ChatTemplateContentFormatOption,
         add_generation_prompt: bool = True,
         continue_final_message: bool = False,
-        tool_dicts: Optional[List[Dict[str, Any]]] = None,
-        documents: Optional[List[Dict[str, str]]] = None,
-        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        tool_dicts: Optional[list[dict[str, Any]]] = None,
+        documents: Optional[list[dict[str, str]]] = None,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
         tool_parser: Optional[Callable[[AnyTokenizer], ToolParser]] = None,
         truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
         add_special_tokens: bool = False,
-    ) -> Tuple[List[ConversationMessage], Sequence[RequestPrompt],
-               List[TokensPrompt]]:
+    ) -> tuple[list[ConversationMessage], Sequence[RequestPrompt],
+               list[TokensPrompt]]:
+        model_config = self.model_config
+
         resolved_content_format = resolve_chat_template_content_format(
+            model_config,
             chat_template,
+            tool_dicts,
             chat_template_content_format,
             tokenizer,
         )
         conversation, mm_data_future = parse_chat_messages_futures(
             messages,
-            self.model_config,
+            model_config,
             tokenizer,
             content_format=resolved_content_format,
         )
 
-        _chat_template_kwargs: Dict[str, Any] = dict(
+        _chat_template_kwargs: dict[str, Any] = dict(
             chat_template=chat_template,
             add_generation_prompt=add_generation_prompt,
             continue_final_message=continue_final_message,
@@ -466,9 +692,8 @@ class OpenAIServing:
         )
         _chat_template_kwargs.update(chat_template_kwargs or {})
 
-        request_prompt: Union[str, List[int]]
-        is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
-        if is_mistral_tokenizer:
+        request_prompt: Union[str, list[int]]
+        if isinstance(tokenizer, MistralTokenizer):
             request_prompt = apply_mistral_chat_template(
                 tokenizer,
                 messages=messages,
@@ -476,6 +701,7 @@ class OpenAIServing:
             )
         else:
             request_prompt = apply_hf_chat_template(
+                model_config,
                 tokenizer,
                 conversation=conversation,
                 **_chat_template_kwargs,
@@ -517,6 +743,11 @@ class OpenAIServing:
             prompt_token_ids=prompt_inputs["prompt_token_ids"])
         if mm_data is not None:
             engine_prompt["multi_modal_data"] = mm_data
+        if request.mm_processor_kwargs is not None:
+            engine_prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
+
+        if hasattr(request, "cache_salt") and request.cache_salt is not None:
+            engine_prompt["cache_salt"] = request.cache_salt
 
         return conversation, [request_prompt], [engine_prompt]
 
@@ -566,6 +797,16 @@ class OpenAIServing:
         return None
 
     @staticmethod
+    def _base_request_id(raw_request: Optional[Request],
+                         default: Optional[str] = None) -> Optional[str]:
+        """Pulls the request id to use from a header, if provided"""
+        default = default or random_uuid()
+        if raw_request is None:
+            return default
+
+        return raw_request.headers.get("X-Request-Id", default)
+
+    @staticmethod
     def _get_decoded_token(logprob: Logprob,
                            token_id: int,
                            tokenizer: AnyTokenizer,
@@ -577,78 +818,31 @@ class OpenAIServing:
             return logprob.decoded_token
         return tokenizer.decode(token_id)
 
-    async def _check_load_lora_adapter_request(
-            self, request: LoadLoraAdapterRequest) -> Optional[ErrorResponse]:
-        # Check if both 'lora_name' and 'lora_path' are provided
-        if not request.lora_name or not request.lora_path:
-            return self.create_error_response(
-                message="Both 'lora_name' and 'lora_path' must be provided.",
-                err_type="InvalidUserInput",
-                status_code=HTTPStatus.BAD_REQUEST)
+    def _is_model_supported(self, model_name: Optional[str]) -> bool:
+        if not model_name:
+            return True
+        return self.models.is_base_model(model_name)
 
-        # Check if the lora adapter with the given name already exists
-        if any(lora_request.lora_name == request.lora_name
-               for lora_request in self.lora_requests):
-            return self.create_error_response(
-                message=
-                f"The lora adapter '{request.lora_name}' has already been"
-                "loaded.",
-                err_type="InvalidUserInput",
-                status_code=HTTPStatus.BAD_REQUEST)
+    def _get_model_name(self,
+                        model_name: Optional[str] = None,
+                        lora_request: Optional[LoRARequest] = None) -> str:
+        if lora_request:
+            return lora_request.lora_name
+        if not model_name:
+            return self.models.base_model_paths[0].name
+        return model_name
 
-        return None
 
-    async def _check_unload_lora_adapter_request(
-            self,
-            request: UnloadLoraAdapterRequest) -> Optional[ErrorResponse]:
-        # Check if either 'lora_name' or 'lora_int_id' is provided
-        if not request.lora_name and not request.lora_int_id:
-            return self.create_error_response(
-                message=
-                "either 'lora_name' and 'lora_int_id' needs to be provided.",
-                err_type="InvalidUserInput",
-                status_code=HTTPStatus.BAD_REQUEST)
+def clamp_prompt_logprobs(
+    prompt_logprobs: Union[PromptLogprobs,
+                           None]) -> Union[PromptLogprobs, None]:
+    if prompt_logprobs is None:
+        return prompt_logprobs
 
-        # Check if the lora adapter with the given name exists
-        if not any(lora_request.lora_name == request.lora_name
-                   for lora_request in self.lora_requests):
-            return self.create_error_response(
-                message=
-                f"The lora adapter '{request.lora_name}' cannot be found.",
-                err_type="InvalidUserInput",
-                status_code=HTTPStatus.BAD_REQUEST)
-
-        return None
-
-    async def load_lora_adapter(
-            self,
-            request: LoadLoraAdapterRequest) -> Union[ErrorResponse, str]:
-        error_check_ret = await self._check_load_lora_adapter_request(request)
-        if error_check_ret is not None:
-            return error_check_ret
-
-        lora_name, lora_path = request.lora_name, request.lora_path
-        unique_id = self.lora_id_counter.inc(1)
-        self.lora_requests.append(
-            LoRARequest(lora_name=lora_name,
-                        lora_int_id=unique_id,
-                        lora_path=lora_path))
-        return f"Success: LoRA adapter '{lora_name}' added successfully."
-
-    async def unload_lora_adapter(
-            self,
-            request: UnloadLoraAdapterRequest) -> Union[ErrorResponse, str]:
-        error_check_ret = await self._check_unload_lora_adapter_request(request
-                                                                        )
-        if error_check_ret is not None:
-            return error_check_ret
-
-        lora_name = request.lora_name
-        self.lora_requests = [
-            lora_request for lora_request in self.lora_requests
-            if lora_request.lora_name != lora_name
-        ]
-        return f"Success: LoRA adapter '{lora_name}' removed successfully."
-
-    def _is_model_supported(self, model_name):
-        return any(model.name == model_name for model in self.base_model_paths)
+    for logprob_dict in prompt_logprobs:
+        if logprob_dict is None:
+            continue
+        for logprob_values in logprob_dict.values():
+            if logprob_values.logprob == float('-inf'):
+                logprob_values.logprob = -9999.0
+    return prompt_logprobs
